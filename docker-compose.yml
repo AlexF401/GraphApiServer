@@ -1,0 +1,16 @@
+services:
+  graphapiserver:
+    build: .
+    image: graphapiserver:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_PATH: /data/emails.db
+    ports:
+      - "8000:8000"
+    volumes:
+      - email-data:/data
+    stop_grace_period: 15s
+
+volumes:
+  email-data:

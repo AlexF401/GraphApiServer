@@ -2,18 +2,47 @@
 
 A small central service that sends email through Microsoft Graph, so your apps call one HTTP API and don't each need their own Graph setup.
 
-> Status: step 2 of 4 (send API plus queue, scheduling, retries and failure log). Docker packaging comes next.
+> Status: step 3 of 4 (send API, queue, scheduling, retries, failure log and Docker).
+
+**New to Docker? Follow the [step-by-step setup guide](docs/SETUP.md).** It covers installing Docker, filling in settings, sending a test email, everyday commands and troubleshooting.
 
 ## Setup
 
 1. In Entra ID, the app registration needs the **application** permission `Mail.Send`, with admin consent.
+   Recommended: application `Mail.Send` can send as *any* mailbox in the tenant, so limit it to the sender mailbox with an Exchange [RBAC for Applications](https://learn.microsoft.com/exchange/permissions-exo/application-rbac) scope (or the older Application Access Policy).
 2. Copy `.env.example` to `.env` and fill in the tenant ID, client ID, secret, sender address and one API key per calling app.
-3. Install and run:
+3. Run it with Docker (below), or directly with Python:
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+## Running with Docker
+
+On each server:
+
+```bash
+git clone https://github.com/AlexF401/GraphApiServer.git && cd GraphApiServer
+cp .env.example .env    # fill in tenant, client ID, secret, sender address and API keys
+docker compose up -d --build
+curl http://localhost:8000/health
+```
+
+- The queue lives in the `email-data` volume at `/data/emails.db`, so queued and failed emails survive restarts, upgrades and `docker compose down` (but not `down -v`).
+- Each server has its own queue. Point each app at whichever server it should use.
+- Logs, including every failed send: `docker compose logs -f`.
+- Upgrade: `git pull && docker compose up -d --build`. Emails that were mid-send are retried on startup.
+- The container runs as a non-root user, has a Docker health check on `/health`, and runs a single process (the queue worker lives inside it, so don't add uvicorn `--workers`).
+- The API is plain HTTP on port 8000. If apps reach it over the internet rather than a private network, put it behind HTTPS (e.g. Caddy, nginx or a cloud load balancer), since API keys travel in a header.
+
+Without compose:
+
+```bash
+docker build -t graphapiserver .
+docker run -d --name graphapiserver --restart unless-stopped \
+  --env-file .env -p 8000:8000 -v graphapiserver-data:/data graphapiserver
 ```
 
 ## Sending an email

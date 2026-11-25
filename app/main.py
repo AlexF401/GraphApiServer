@@ -34,7 +34,7 @@ async def lifespan(app: FastAPI):
             worker.stop()
 
 
-app = FastAPI(title="Graph email service", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="Graph email service", version="0.3.0", lifespan=lifespan)
 
 
 def get_store(request: Request) -> EmailStore:
