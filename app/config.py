@@ -26,6 +26,17 @@ class Settings(BaseSettings):
     graph_base_url: str = "https://graph.microsoft.com/v1.0"
     graph_timeout_seconds: float = 30.0
 
+    # Queue / worker
+    database_path: str = "data/emails.db"
+    max_attempts: int = 5
+    # Backoff after a retryable failure: base * 2^(attempt-1), capped. Graph's Retry-After wins if longer.
+    retry_base_seconds: float = 30.0
+    retry_max_seconds: float = 1800.0
+    # Pause between sends so a burst of scheduled emails goes out at a steady pace.
+    send_interval_seconds: float = 0.5
+    worker_poll_seconds: float = 2.0
+    run_worker: bool = True
+
     @field_validator("api_keys", mode="before")
     @classmethod
     def parse_api_keys(cls, value):

@@ -1,45 +1,11 @@
 import base64
+from datetime import datetime, timedelta, timezone
 
-import httpx
-import pytest
-import respx
-from fastapi.testclient import TestClient
+from app.config import Settings
+from app.graph import GraphError
 
-from app.config import Settings, get_settings
-from app.graph import GraphMailer
-from app.main import app
-
-SEND_URL = "https://graph.microsoft.com/v1.0/users/noreply@example.com/sendMail"
-
-
-class FakeMsal:
-    def __init__(self, result=None):
-        self.result = result or {"access_token": "fake-token"}
-
-    def acquire_token_for_client(self, scopes):
-        return self.result
-
-
-@pytest.fixture
-def settings():
-    return Settings(
-        tenant_id="t",
-        client_id="c",
-        client_secret="s",
-        sender_address="noreply@example.com",
-        api_keys="billing:key-billing,crm:key-crm",
-        max_attachment_bytes=1000,
-    )
-
-
-@pytest.fixture
-def client(settings):
-    app.dependency_overrides[get_settings] = lambda: settings
-    app.state.mailer = GraphMailer(settings, http=httpx.Client(), msal_app=FakeMsal())
-    with TestClient(app) as c:
-        yield c
-    app.dependency_overrides.clear()
-    app.state.mailer = None
+BILLING = {"X-API-Key": "key-billing"}
+CRM = {"X-API-Key": "key-crm"}
 
 
 def payload(**extra):
@@ -60,78 +26,90 @@ def test_api_keys_parse_from_env_string(monkeypatch):
 def test_rejects_missing_or_bad_key(client):
     assert client.post("/emails", json=payload()).status_code == 401
     assert client.post("/emails", json=payload(), headers={"X-API-Key": "nope"}).status_code == 401
+    assert client.get("/emails", headers={"X-API-Key": "nope"}).status_code == 401
 
 
-@respx.mock
-def test_sends_email_with_attachment(client):
-    route = respx.post(SEND_URL).mock(return_value=httpx.Response(202))
+def test_queues_and_worker_sends(client, worker, mailer):
     content = base64.b64encode(b"hello file").decode()
     resp = client.post(
         "/emails",
-        headers={"X-API-Key": "key-crm"},
-        json=payload(
-            cc=["cc@example.com"],
-            body_type="text",
-            attachments=[{"name": "a.txt", "content_type": "text/plain", "content_base64": content}],
-        ),
+        headers=CRM,
+        json=payload(attachments=[{"name": "a.txt", "content_type": "text/plain", "content_base64": content}]),
     )
     assert resp.status_code == 202
-    assert resp.json() == {"status": "sent", "app": "crm"}
+    email_id = resp.json()["id"]
+    assert resp.json()["status"] == "queued"
+    assert mailer.sent == []
 
-    sent = route.calls.last.request
-    assert sent.headers["Authorization"] == "Bearer fake-token"
-    import json
+    assert worker.run_once() is True
+    assert len(mailer.sent) == 1
+    assert mailer.sent[0].attachments[0].name == "a.txt"
 
-    msg = json.loads(sent.content)["message"]
-    assert msg["toRecipients"] == [{"emailAddress": {"address": "someone@example.com"}}]
-    assert msg["ccRecipients"] == [{"emailAddress": {"address": "cc@example.com"}}]
-    assert msg["body"]["contentType"] == "Text"
-    assert msg["attachments"][0]["name"] == "a.txt"
-    assert msg["attachments"][0]["contentBytes"] == content
+    status = client.get(f"/emails/{email_id}", headers=CRM).json()
+    assert status["status"] == "sent"
+    assert status["attempts"] == 1
+    assert status["sent_at"] is not None
+
+
+def test_scheduled_email_waits_until_send_at(client, worker, mailer):
+    later = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    resp = client.post("/emails", headers=BILLING, json=payload(send_at=later))
+    assert resp.status_code == 202
+    assert worker.run_once() is False
+    assert mailer.sent == []
+
+
+def test_naive_send_at_is_utc(client):
+    resp = client.post("/emails", headers=BILLING, json=payload(send_at="2030-01-01T09:00:00"))
+    assert resp.json()["send_at"].startswith("2030-01-01T09:00:00")
+    assert resp.json()["send_at"].endswith(("Z", "+00:00"))
+
+
+def test_failure_log_and_retry_endpoint(client, worker, mailer):
+    email_id = client.post("/emails", headers=BILLING, json=payload()).json()["id"]
+    mailer.errors.append(GraphError("Graph returned 403: Access is denied.", 403, retryable=False))
+    worker.run_once()
+
+    failed = client.get("/emails?status=failed", headers=BILLING).json()
+    assert [e["id"] for e in failed] == [email_id]
+    assert "Access is denied" in failed[0]["last_error"]
+
+    resp = client.post(f"/emails/{email_id}/retry", headers=BILLING)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "queued"
+    worker.run_once()
+    assert client.get(f"/emails/{email_id}", headers=BILLING).json()["status"] == "sent"
+
+    # A sent email can't be retried.
+    assert client.post(f"/emails/{email_id}/retry", headers=BILLING).status_code == 409
+
+
+def test_apps_only_see_their_own_emails(client):
+    email_id = client.post("/emails", headers=BILLING, json=payload()).json()["id"]
+    assert client.get(f"/emails/{email_id}", headers=CRM).status_code == 404
+    assert client.get("/emails", headers=CRM).json() == []
+    assert len(client.get("/emails", headers=BILLING).json()) == 1
 
 
 def test_rejects_oversized_attachments(client):
     big = base64.b64encode(b"x" * 1001).decode()
-    resp = client.post(
-        "/emails",
-        headers={"X-API-Key": "key-billing"},
-        json=payload(attachments=[{"name": "big.bin", "content_base64": big}]),
-    )
+    resp = client.post("/emails", headers=BILLING, json=payload(attachments=[{"name": "big.bin", "content_base64": big}]))
     assert resp.status_code == 413
 
 
 def test_rejects_invalid_base64(client):
     resp = client.post(
-        "/emails",
-        headers={"X-API-Key": "key-billing"},
-        json=payload(attachments=[{"name": "bad", "content_base64": "not base64!!"}]),
+        "/emails", headers=BILLING, json=payload(attachments=[{"name": "bad", "content_base64": "not base64!!"}])
     )
     assert resp.status_code == 422
 
 
 def test_rejects_bad_address(client):
-    resp = client.post("/emails", headers={"X-API-Key": "key-billing"}, json=payload(to=["not-an-email"]))
-    assert resp.status_code == 422
+    assert client.post("/emails", headers=BILLING, json=payload(to=["not-an-email"])).status_code == 422
 
 
-@respx.mock
-def test_graph_error_returns_502(client):
-    respx.post(SEND_URL).mock(
-        return_value=httpx.Response(403, json={"error": {"code": "ErrorAccessDenied", "message": "Access is denied."}})
-    )
-    resp = client.post("/emails", headers={"X-API-Key": "key-billing"}, json=payload())
-    assert resp.status_code == 502
-    assert "Access is denied" in resp.json()["detail"]
-
-
-def test_token_failure_returns_502(client, settings):
-    app.state.mailer = GraphMailer(
-        settings, http=httpx.Client(), msal_app=FakeMsal({"error": "invalid_client", "error_description": "bad secret"})
-    )
-    resp = client.post("/emails", headers={"X-API-Key": "key-billing"}, json=payload())
-    assert resp.status_code == 502
-    assert "bad secret" in resp.json()["detail"]
-
-
-def test_health(client):
-    assert client.get("/health").json() == {"status": "ok"}
+def test_health_reports_queue(client):
+    client.post("/emails", headers=BILLING, json=payload())
+    body = client.get("/health").json()
+    assert body["status"] == "ok"
+    assert body["queue"]["queued"] == 1

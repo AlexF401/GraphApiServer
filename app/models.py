@@ -1,5 +1,6 @@
 import base64
 import binascii
+from datetime import datetime, timezone
 from typing import Literal
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
@@ -33,6 +34,15 @@ class EmailRequest(BaseModel):
     body: str
     body_type: Literal["html", "text"] = "html"
     attachments: list[Attachment] = Field(default_factory=list)
+    # When to send. Omit to send as soon as possible. Times without a zone are treated as UTC.
+    send_at: datetime | None = None
+
+    @field_validator("send_at")
+    @classmethod
+    def assume_utc(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value
 
     @model_validator(mode="after")
     def limit_recipients(self):
@@ -46,6 +56,26 @@ class EmailRequest(BaseModel):
         return sum(a.size_bytes for a in self.attachments)
 
 
-class EmailAccepted(BaseModel):
-    status: Literal["sent"]
+class EmailQueued(BaseModel):
+    id: str
+    status: str
+    send_at: datetime
+
+
+class EmailStatus(BaseModel):
+    id: str
     app: str
+    status: Literal["queued", "sending", "sent", "failed"]
+    subject: str
+    recipients: list[str]
+    attempts: int
+    last_error: str | None
+    send_at: datetime
+    next_attempt_at: datetime
+    created_at: datetime
+    updated_at: datetime
+    sent_at: datetime | None
+
+    @classmethod
+    def from_record(cls, r) -> "EmailStatus":
+        return cls(**{f: getattr(r, f) for f in cls.model_fields})
