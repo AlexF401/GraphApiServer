@@ -1,7 +1,7 @@
 from functools import lru_cache
-from typing import Annotated
+from typing import Annotated, Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -10,10 +10,16 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
+    # "delegated": a person signs in once (python -m app.signin) and mail is sent as them.
+    # "application": app-only client credentials, sending from SENDER_ADDRESS.
+    auth_mode: Literal["delegated", "application"] = "delegated"
+
     tenant_id: str
     client_id: str
-    client_secret: str
-    sender_address: str
+    client_secret: str | None = None  # application mode only
+    sender_address: str | None = None  # application mode only; delegated sends as the signed-in account
+    # Where the delegated sign-in (refresh token) is kept. Put it on the data volume.
+    token_cache_path: str = "data/token_cache.json"
 
     # "app1:key1,app2:key2" -> {"key1": "app1", "key2": "app2"}
     api_keys: Annotated[dict[str, str], NoDecode] = Field(default_factory=dict)
@@ -36,6 +42,12 @@ class Settings(BaseSettings):
     send_interval_seconds: float = 0.5
     worker_poll_seconds: float = 2.0
     run_worker: bool = True
+
+    @model_validator(mode="after")
+    def check_mode(self):
+        if self.auth_mode == "application" and not (self.client_secret and self.sender_address):
+            raise ValueError("AUTH_MODE=application needs CLIENT_SECRET and SENDER_ADDRESS")
+        return self
 
     @field_validator("api_keys", mode="before")
     @classmethod

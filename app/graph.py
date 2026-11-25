@@ -1,17 +1,14 @@
-"""Thin client for sending mail through Microsoft Graph with app-only auth."""
+"""Thin client for sending mail through Microsoft Graph."""
 
 import logging
 
 import httpx
-import msal
 
+from .auth import AuthError, NotSignedIn, build_auth
 from .config import Settings
 from .models import EmailRequest
 
 log = logging.getLogger(__name__)
-
-GRAPH_SCOPE = ["https://graph.microsoft.com/.default"]
-
 
 class GraphError(Exception):
     """Raised when Graph (or token acquisition) rejects a send."""
@@ -29,6 +26,8 @@ class GraphError(Exception):
         self.retryable = retryable
         # Seconds Graph asked us to wait (Retry-After header), if it said.
         self.retry_after = retry_after
+        # Delegated mode with no usable sign-in: the email should wait, not use up attempts.
+        self.not_signed_in = False
 
 
 def build_message(email: EmailRequest) -> dict:
@@ -60,40 +59,33 @@ def build_message(email: EmailRequest) -> dict:
 
 
 class GraphMailer:
-    def __init__(self, settings: Settings, http: httpx.Client | None = None, msal_app=None):
+    def __init__(self, settings: Settings, http: httpx.Client | None = None, auth=None):
         self.settings = settings
         self.http = http or httpx.Client(timeout=settings.graph_timeout_seconds)
-        # Built lazily: MSAL contacts Entra on construction, and the service should
-        # still start (and queue mail) if Entra is briefly unreachable.
-        self.msal_app = msal_app
+        self.auth = auth or build_auth(settings)
 
-    def _msal(self):
-        if self.msal_app is None:
-            # MSAL caches the token in memory and refreshes it when it expires.
-            self.msal_app = msal.ConfidentialClientApplication(
-                client_id=self.settings.client_id,
-                client_credential=self.settings.client_secret,
-                authority=f"https://login.microsoftonline.com/{self.settings.tenant_id}",
-            )
-        return self.msal_app
+    def ready(self) -> bool:
+        """False while delegated mode has no sign-in; the worker then leaves the queue alone."""
+        return self.auth.ready()
 
     def _token(self) -> str:
         try:
-            result = self._msal().acquire_token_for_client(scopes=GRAPH_SCOPE)
-        except Exception as exc:  # MSAL raises if Entra is unreachable or the tenant is wrong
-            raise GraphError(f"could not get Graph token: {exc}", retryable=True) from exc
-        if "access_token" not in result:
-            detail = result.get("error_description") or result.get("error") or "unknown error"
-            # Bad credentials won't fix themselves, but a network blip reaching Entra will.
-            retryable = result.get("error") not in ("invalid_client", "unauthorized_client", "invalid_request")
-            raise GraphError(f"could not get Graph token: {detail}", retryable=retryable)
-        return result["access_token"]
+            return self.auth.get_token()
+        except AuthError as exc:
+            err = GraphError(str(exc), retryable=exc.retryable)
+            err.not_signed_in = isinstance(exc, NotSignedIn)
+            raise err from exc
 
     def send(self, email: EmailRequest) -> None:
-        url = f"{self.settings.graph_base_url}/users/{self.settings.sender_address}/sendMail"
+        if self.auth.mode == "delegated":
+            # Sends as the signed-in account.
+            url = f"{self.settings.graph_base_url}/me/sendMail"
+        else:
+            url = f"{self.settings.graph_base_url}/users/{self.settings.sender_address}/sendMail"
         payload = {"message": build_message(email), "saveToSentItems": self.settings.save_to_sent_items}
+        token = self._token()
         try:
-            resp = self.http.post(url, json=payload, headers={"Authorization": f"Bearer {self._token()}"})
+            resp = self.http.post(url, json=payload, headers={"Authorization": f"Bearer {token}"})
         except httpx.HTTPError as exc:
             raise GraphError(f"could not reach Graph: {exc}", retryable=True) from exc
 

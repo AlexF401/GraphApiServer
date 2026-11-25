@@ -172,6 +172,16 @@ class EmailStore:
                 (QUEUED, error, to_db(next_attempt_at), to_db(utcnow()), email_id),
             )
 
+    def release(self, email_id: str, error: str) -> None:
+        """Put a claimed email back without counting the attempt (e.g. nobody is signed in)."""
+        now = to_db(utcnow())
+        with self._lock:
+            self._conn.execute(
+                "UPDATE emails SET status = ?, attempts = MAX(attempts - 1, 0), last_error = ?,"
+                " next_attempt_at = ?, updated_at = ? WHERE id = ?",
+                (QUEUED, error, now, now, email_id),
+            )
+
     def mark_failed(self, email_id: str, error: str) -> None:
         with self._lock:
             self._conn.execute(

@@ -5,6 +5,7 @@ import httpx
 import pytest
 import respx
 
+from app.auth import AppOnlyAuth
 from app.graph import GraphError, GraphMailer
 from app.models import EmailRequest
 
@@ -23,7 +24,7 @@ def email(**extra):
 def test_builds_graph_payload(settings):
     route = respx.post(SEND_URL).mock(return_value=httpx.Response(202))
     content = base64.b64encode(b"hello file").decode()
-    GraphMailer(settings, http=httpx.Client(), msal_app=FakeMsal()).send(
+    GraphMailer(settings, http=httpx.Client(), auth=AppOnlyAuth(settings, msal_app=FakeMsal())).send(
         email(
             cc=["cc@example.com"],
             body_type="text",
@@ -50,7 +51,7 @@ def test_builds_graph_payload(settings):
 def test_403_is_not_retryable(settings):
     respx.post(SEND_URL).mock(return_value=httpx.Response(403, json={"error": {"message": "Access is denied."}}))
     with pytest.raises(GraphError) as exc:
-        GraphMailer(settings, http=httpx.Client(), msal_app=FakeMsal()).send(email())
+        GraphMailer(settings, http=httpx.Client(), auth=AppOnlyAuth(settings, msal_app=FakeMsal())).send(email())
     assert exc.value.status_code == 403
     assert not exc.value.retryable
     assert "Access is denied" in str(exc.value)
@@ -60,7 +61,7 @@ def test_403_is_not_retryable(settings):
 def test_429_is_retryable_with_retry_after(settings):
     respx.post(SEND_URL).mock(return_value=httpx.Response(429, headers={"Retry-After": "42"}, json={}))
     with pytest.raises(GraphError) as exc:
-        GraphMailer(settings, http=httpx.Client(), msal_app=FakeMsal()).send(email())
+        GraphMailer(settings, http=httpx.Client(), auth=AppOnlyAuth(settings, msal_app=FakeMsal())).send(email())
     assert exc.value.retryable
     assert exc.value.retry_after == 42
 
@@ -69,13 +70,13 @@ def test_429_is_retryable_with_retry_after(settings):
 def test_network_error_is_retryable(settings):
     respx.post(SEND_URL).mock(side_effect=httpx.ConnectError("boom"))
     with pytest.raises(GraphError) as exc:
-        GraphMailer(settings, http=httpx.Client(), msal_app=FakeMsal()).send(email())
+        GraphMailer(settings, http=httpx.Client(), auth=AppOnlyAuth(settings, msal_app=FakeMsal())).send(email())
     assert exc.value.retryable
 
 
 def test_bad_credentials_not_retryable(settings):
     msal = FakeMsal({"error": "invalid_client", "error_description": "bad secret"})
     with pytest.raises(GraphError) as exc:
-        GraphMailer(settings, http=httpx.Client(), msal_app=msal).send(email())
+        GraphMailer(settings, http=httpx.Client(), auth=AppOnlyAuth(settings, msal_app=msal)).send(email())
     assert not exc.value.retryable
     assert "bad secret" in str(exc.value)

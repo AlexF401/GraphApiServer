@@ -2,15 +2,14 @@
 
 A small central service that sends email through Microsoft Graph, so your apps call one HTTP API and don't each need their own Graph setup.
 
-> Status: step 3 of 4 (send API, queue, scheduling, retries, failure log and Docker).
+> Status: send API, queue, scheduling, retries, failure log, Docker, and delegated (signed-in user) sending.
 
 **New to Docker? Follow the [step-by-step setup guide](docs/SETUP.md).** It covers installing Docker, filling in settings, sending a test email, everyday commands and troubleshooting.
 
 ## Setup
 
-1. In Entra ID, the app registration needs the **application** permission `Mail.Send`, with admin consent.
-   Recommended: application `Mail.Send` can send as *any* mailbox in the tenant, so limit it to the sender mailbox with an Exchange [RBAC for Applications](https://learn.microsoft.com/exchange/permissions-exo/application-rbac) scope (or the older Application Access Policy).
-2. Copy `.env.example` to `.env` and fill in the tenant ID, client ID, secret, sender address and one API key per calling app.
+1. In Entra ID, set up the app registration for **delegated** sending: delegated `Mail.Send` permission and **Allow public client flows = Yes** (details in [docs/SETUP.md](docs/SETUP.md#step-3-set-up-the-app-registration-in-microsoft-entra)). No client secret is needed.
+2. Copy `.env.example` to `.env` and fill in the tenant ID, client ID and one API key per calling app.
 3. Run it with Docker (below), or directly with Python:
 
 ```bash
@@ -45,6 +44,23 @@ docker run -d --name graphapiserver --restart unless-stopped \
   --env-file .env -p 8000:8000 -v graphapiserver-data:/data graphapiserver
 ```
 
+## Signing in (delegated mode)
+
+By default (`AUTH_MODE=delegated`) the service sends **as a signed-in mailbox**. After starting it, sign in once per server:
+
+```bash
+docker compose exec graphapiserver python -m app.signin            # shows a code to enter at microsoft.com/devicelogin
+docker compose exec graphapiserver python -m app.signin --status   # who is it signed in as?
+docker compose exec graphapiserver python -m app.signin --sign-out
+```
+
+- The sign-in (an MSAL refresh token) is saved at `/data/token_cache.json` on the volume, readable only by the service user. It survives restarts, and access tokens are refreshed automatically.
+- While nobody is signed in, or after the sign-in expires (password reset, revoked sessions, roughly 90 days with no sends, or Conditional Access policy), emails **stay queued** and their attempts aren't used up. They go out as soon as someone signs in again.
+- `GET /health` includes `signed_in`. `GET /auth/status` (needs an API key) also shows the account.
+- Mail is sent with `POST /me/sendMail`, so it always comes from the signed-in account.
+
+To use app-only permissions instead, set `AUTH_MODE=application`, `CLIENT_SECRET` and `SENDER_ADDRESS`, and grant the **application** `Mail.Send` permission with admin consent. Application `Mail.Send` can send as *any* mailbox in the tenant, so limit it with an Exchange [RBAC for Applications](https://learn.microsoft.com/exchange/permissions-exo/application-rbac) scope.
+
 ## Sending an email
 
 ```bash
@@ -59,6 +75,17 @@ curl -X POST http://localhost:8000/emails \
           {"name": "report.txt", "content_type": "text/plain", "content_base64": "aGVsbG8="}
         ]
       }'
+```
+
+Windows PowerShell (`curl` there is `Invoke-WebRequest`, so use `Invoke-RestMethod` or `curl.exe`):
+
+```powershell
+$body = @{
+  to = @("someone@example.com"); subject = "Monthly report"; body = "<p>Report attached.</p>"
+  attachments = @(@{ name = "report.txt"; content_type = "text/plain"; content_base64 = "aGVsbG8=" })
+} | ConvertTo-Json -Depth 4
+Invoke-RestMethod -Method Post -Uri http://localhost:8000/emails `
+  -Headers @{ "X-API-Key" = "replace-with-long-random-key" } -ContentType "application/json" -Body $body
 ```
 
 Fields: `to` (required), `cc`, `bcc`, `reply_to`, `subject`, `body`, `body_type` (`html` or `text`), `attachments`, `send_at`.
@@ -78,7 +105,7 @@ Pass `send_at` (ISO 8601, e.g. `"2026-12-01T08:00:00-05:00"`; no zone means UTC)
 
 ### Retries and failures
 
-If Graph throttles (429), times out, has a 5xx or can't be reached, the email is retried with exponential backoff (30s, 60s, 120s... capped at 30 min, or longer if Graph sends `Retry-After`), up to `MAX_ATTEMPTS` (5). Errors that won't fix themselves (bad recipient, access denied, bad credentials) fail straight away.
+If Graph throttles (429), times out, has a 5xx or can't be reached, the email is retried with exponential backoff (30s, 60s, 120s... capped at 30 min, or longer if Graph sends `Retry-After`), up to `MAX_ATTEMPTS` (5). Errors that won't fix themselves (bad recipient, access denied, bad credentials) fail straight away. In delegated mode, a missing or expired sign-in never fails an email: it waits in the queue.
 
 Every failure is logged to stdout with the email id, app, recipients and error, and kept in the database.
 
@@ -87,7 +114,8 @@ Every failure is logged to stdout with the email id, app, recipients and error, 
 | `GET /emails/{id}` | Status of one email: `queued`, `sending`, `sent` or `failed`, with `attempts` and `last_error` |
 | `GET /emails?status=failed` | Failure log for your app (newest first; `limit`, `offset`) |
 | `POST /emails/{id}/retry` | Put a failed email back in the queue |
-| `GET /health` | Liveness plus queue counts |
+| `GET /health` | Liveness, `signed_in`, and queue counts |
+| `GET /auth/status` | Auth mode and the account emails are sent as |
 
 Each app only sees its own emails.
 

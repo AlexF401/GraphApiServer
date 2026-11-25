@@ -6,6 +6,7 @@ services:
     env_file: .env
     environment:
       DATABASE_PATH: /data/emails.db
+      TOKEN_CACHE_PATH: /data/token_cache.json
     ports:
       - "8000:8000"
     volumes:
