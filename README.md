@@ -4,6 +4,8 @@ A small central service that sends email through Microsoft Graph, so your apps c
 
 > Status: step 3 of 4 (send API, queue, scheduling, retries, failure log and Docker).
 
+**New to Docker? Follow the [step-by-step setup guide](docs/SETUP.md).** It covers installing Docker, filling in settings, sending a test email, everyday commands and troubleshooting.
+
 ## Setup
 
 1. In Entra ID, the app registration needs the **application** permission `Mail.Send`, with admin consent.
