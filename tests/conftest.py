@@ -22,6 +22,16 @@ class FakeMailer:
     def __init__(self):
         self.sent = []
         self.errors: list[GraphError] = []
+        self.signed_in = True
+        self.auth = self
+
+    mode = "delegated"
+
+    def ready(self):
+        return self.signed_in
+
+    def status(self):
+        return {"mode": "delegated", "signed_in": self.signed_in, "account": "sender@example.com" if self.signed_in else None}
 
     def send(self, email):
         if self.errors:
@@ -33,6 +43,7 @@ class FakeMailer:
 def settings():
     return Settings(
         _env_file=None,
+        auth_mode="application",
         tenant_id="t",
         client_id="c",
         client_secret="s",

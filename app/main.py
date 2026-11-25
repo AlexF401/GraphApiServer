@@ -23,6 +23,11 @@ async def lifespan(app: FastAPI):
         app.state.store = EmailStore(settings.database_path)
     if getattr(app.state, "mailer", None) is None:
         app.state.mailer = GraphMailer(settings)
+    auth = app.state.mailer.auth.status()
+    if auth["signed_in"]:
+        log.info("auth mode=%s, sending as %s", auth["mode"], auth["account"])
+    else:
+        log.warning("auth mode=%s: NOT signed in. Emails will queue until you run the sign-in command.", auth["mode"])
     worker = None
     if settings.run_worker:
         worker = QueueWorker(app.state.store, app.state.mailer, settings)
@@ -34,7 +39,7 @@ async def lifespan(app: FastAPI):
             worker.stop()
 
 
-app = FastAPI(title="Graph email service", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="Graph email service", version="0.4.0", lifespan=lifespan)
 
 
 def get_store(request: Request) -> EmailStore:
@@ -61,9 +66,20 @@ def owned_email(email_id: str, app_name: str, store: EmailStore):
     return record
 
 
+def get_mailer(request: Request) -> GraphMailer:
+    return request.app.state.mailer
+
+
 @app.get("/health")
-def health(store: EmailStore = Depends(get_store)) -> dict:
-    return {"status": "ok", "queue": store.counts()}
+def health(store: EmailStore = Depends(get_store), mailer: GraphMailer = Depends(get_mailer)) -> dict:
+    auth = mailer.auth.status()
+    return {"status": "ok", "signed_in": auth["signed_in"], "queue": store.counts()}
+
+
+@app.get("/auth/status")
+def auth_status(_: str = Depends(require_app), mailer: GraphMailer = Depends(get_mailer)) -> dict:
+    """Which account emails are sent as, and whether the sign-in is in place."""
+    return mailer.auth.status()
 
 
 @app.post("/emails", status_code=status.HTTP_202_ACCEPTED, response_model=EmailQueued)

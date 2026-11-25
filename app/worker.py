@@ -2,6 +2,7 @@
 
 import logging
 import threading
+import time
 from datetime import timedelta
 
 from .config import Settings
@@ -19,6 +20,7 @@ class QueueWorker:
         self.settings = settings
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._last_signin_warning = 0.0
 
     def backoff_seconds(self, attempts: int, retry_after: float | None) -> float:
         delay = min(self.settings.retry_base_seconds * 2 ** (attempts - 1), self.settings.retry_max_seconds)
@@ -31,7 +33,12 @@ class QueueWorker:
         try:
             self.mailer.send(EmailRequest.model_validate(record.payload))
         except GraphError as exc:
-            self._handle_failure(record, str(exc), exc.retryable, exc.retry_after)
+            if exc.not_signed_in:
+                # Leave it queued; the worker pauses until someone signs in.
+                self.store.release(record.id, str(exc))
+                log.warning("not signed in, email id=%s stays queued: %s", record.id, exc)
+            else:
+                self._handle_failure(record, str(exc), exc.retryable, exc.retry_after)
         except Exception as exc:  # never let one bad email kill the worker
             log.exception("unexpected error sending id=%s", record.id)
             self._handle_failure(record, f"unexpected error: {exc!r}", retryable=False, retry_after=None)
@@ -59,6 +66,12 @@ class QueueWorker:
 
     def run_once(self) -> bool:
         """Send at most one due email. Returns True if one was processed."""
+        if not self.mailer.ready():
+            # Delegated mode with nobody signed in: keep emails queued rather than failing them.
+            if self.store.counts()["queued"] and time.monotonic() - self._last_signin_warning > 300:
+                log.warning("not signed in to Microsoft: queued emails are waiting. Run the sign-in command.")
+                self._last_signin_warning = time.monotonic()
+            return False
         record = self.store.claim_due()
         if record is None:
             return False
